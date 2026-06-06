@@ -1,0 +1,1081 @@
+--[[
+    ╔══════════════════════════════════════════════════════════════╗
+    ║       BLADE BALL — ULTIMATE PRO SCRIPT v7.0                  ║
+    ║   Source: AFGClient + Oxyo Hub (eVG9rCVm) decompile          ║
+    ║                                                              ║
+    ║   Features:                                                  ║
+    ║   • Parry Range: Oxyo Hub–doğrulanmış formül                 ║
+    ║   • Future Position Prediction (ping-aware)                  ║
+    ║   • Curved Ball Detection (dot history)                      ║
+    ║   • Singularity Cape / Infinity / Time Hole Detection        ║
+    ║   • Phantom Detection (remote listener)                      ║
+    ║   • Ability ESP (EquippedAbility attribute)                  ║
+    ║   • Statistics Panel (speed, accuracy, streak, persistent)   ║
+    ║   • Anti-Dash, Anti-Shield (heuristic)                       ║
+    ║   • Visualizer (TTA, range, curved)                          ║
+    ║   • Anti-Tornado & Auto Pre-Click (Target Swap)             ║
+    ║   • Interactive GUI Slider for Parry Accuracy                ║
+    ║   • Real-time HUD Screen Overlay (Speed, Target, TTA)        ║
+    ║                                                              ║
+    ║   Controls:                                                  ║
+    ║     [E]      → Manuel Spam                                   ║
+    ║     [Insert] → GUI gizle/göster                              ║
+    ║     [Tab]    → Stats paneli                                  ║
+    ╚══════════════════════════════════════════════════════════════╝
+--]]
+
+-- ─────────────────────────────────────────────────────────
+--  SERVICES
+-- ─────────────────────────────────────────────────────────
+local Players           = game:GetService("Players")
+local RunService        = game:GetService("RunService")
+local UserInputService  = game:GetService("UserInputService")
+local TweenService      = game:GetService("TweenService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Stats             = game:GetService("Stats")
+local Debris            = game:GetService("Debris")
+local Lighting          = game:GetService("Lighting")
+
+local LP       = Players.LocalPlayer
+local Camera   = workspace.CurrentCamera
+local Runtime  = workspace:WaitForChild("Runtime", 5)
+local Alive    = workspace:WaitForChild("Alive",   5)
+
+-- ─────────────────────────────────────────────────────────
+--  CONFIG
+-- ─────────────────────────────────────────────────────────
+local CFG = {
+    -- Core
+    AutoParry          = true,
+    AutoSpam           = false,
+    ManualSpamKey      = Enum.KeyCode.E,
+    SpamDelay          = 0.03,
+    -- Accuracy slider (1–100 → SpeedDivisorMult 0.7–1.05)
+    ParryAccuracy      = 100,         -- % (slider ile değiştirilir)
+    -- High Ping
+    HighPingCompensation = true,
+    HighPingThreshold  = 150,
+    -- Anti-Ability
+    SingularityDetect  = true,
+    InfinityDetect     = true,
+    TimeHoleDetect     = true,
+    AntiPhantom        = true,
+    TornadoDetect      = true,
+    AutoPreClick       = true,
+    -- Features
+    Visualizer         = true,
+    AbilityESP         = false,
+    NoLag              = true,
+    ShowHUD            = true,
+    -- Colors
+    ColApproach = Color3.fromRGB(255,55,55),
+    ColAway     = Color3.fromRGB(55,120,255),
+    ColLine     = Color3.fromRGB(50,230,255),
+    ColCurved   = Color3.fromRGB(255,165,0),
+    ColPred     = Color3.fromRGB(255,220,30),
+    ColText     = Color3.fromRGB(255,255,255),
+}
+
+-- SpeedDivisorMult = 0.7 + ((accuracy-1)/99)*0.35
+local function getSDMult()
+    return 0.7 + ((CFG.ParryAccuracy - 1) / 99) * 0.35
+end
+
+-- ─────────────────────────────────────────────────────────
+--  STATE
+-- ─────────────────────────────────────────────────────────
+local state = {
+    Parried      = false,
+    ParryTime    = 0,
+    Parries      = 0,      -- spam debounce counter
+
+    -- Phantom & special ability
+    IsPhantom    = false,
+    InfinityBall = false,
+
+    -- Curved detection (dot history per ball)
+    DotHistories = {},
+    VelHistories = {},
+    WasBackwards = {},
+
+    -- New state variables
+    TornadoTime  = 0,
+}
+
+-- ─────────────────────────────────────────────────────────
+--  STATISTICS
+-- ─────────────────────────────────────────────────────────
+local SES = {
+    parry_fired   = 0,
+    parry_success = 0,
+    streak        = 0,
+    streak_best   = 0,
+    speeds        = {},
+    speed_max     = 0,
+    speed_avg     = 0,
+    speed_current = 0,
+    session_start = tick(),
+    last_ok       = false,
+}
+
+-- Save / Load Stats from JSON
+local function saveStats()
+    if writefile then
+        local data = {
+            speed_max = SES.speed_max,
+            parry_success = SES.parry_success,
+            parry_fired = SES.parry_fired,
+            streak_best = SES.streak_best
+        }
+        pcall(writefile, "bladeball_stats.json", game:GetService("HttpService"):JSONEncode(data))
+    end
+end
+
+local function loadStats()
+    if isfile and isfile("bladeball_stats.json") and readfile then
+        local ok, content = pcall(readfile, "bladeball_stats.json")
+        if ok then
+            local ok2, data = pcall(function() return game:GetService("HttpService"):JSONDecode(content) end)
+            if ok2 and type(data) == "table" then
+                SES.speed_max = data.speed_max or 0
+                SES.parry_success = data.parry_success or 0
+                SES.parry_fired = data.parry_fired or 0
+                SES.streak_best = data.streak_best or 0
+            end
+        end
+    end
+end
+
+-- Initialize stats
+loadStats()
+
+local function recordSpeed(s)
+    SES.speed_current = s
+    if s > SES.speed_max then SES.speed_max = s; saveStats() end
+    table.insert(SES.speeds, s); if #SES.speeds > 60 then table.remove(SES.speeds,1) end
+    local sum=0; for _,v in ipairs(SES.speeds) do sum+=v end
+    SES.speed_avg = sum/#SES.speeds
+end
+local function getAcc()
+    return SES.parry_fired==0 and 100 or math.floor(SES.parry_success/SES.parry_fired*100)
+end
+local function sesTime()
+    local s=math.floor(tick()-SES.session_start)
+    return string.format("%02d:%02d",math.floor(s/60),s%60)
+end
+
+-- ─────────────────────────────────────────────────────────
+--  PING
+-- ─────────────────────────────────────────────────────────
+local pingHistory = {}
+local function getRawPing()
+    local ok, v = pcall(function()
+        return Stats.Network.ServerStatsItem["Data Ping"]:GetValue()
+    end)
+    return ok and v or 0
+end
+local function getAvgPing()
+    table.insert(pingHistory, getRawPing())
+    if #pingHistory > 10 then table.remove(pingHistory,1) end
+    local s=0; for _,v in ipairs(pingHistory) do s+=v end
+    return s / #pingHistory
+end
+
+-- ─────────────────────────────────────────────────────────
+--  PARRY REMOTE FINDER
+-- ─────────────────────────────────────────────────────────
+local ParryRemote = nil
+local SVCS = {game:GetService("AdService"), game:GetService("SocialService")}
+
+local function findRemote()
+    for _, svc in ipairs(SVCS) do
+        local re = svc:FindFirstChildOfClass("RemoteEvent")
+        if re and re.Name:find("\n") then ParryRemote = re; return re end
+    end
+end
+task.spawn(function() while not ParryRemote do findRemote(); task.wait(0.5) end
+    print("[BB v7] Remote:", ParryRemote:GetFullName()) end)
+for _, svc in ipairs(SVCS) do
+    svc.DescendantAdded:Connect(function(v)
+        if not ParryRemote and v:IsA("RemoteEvent") and v.Name:find("\n") then
+            ParryRemote = v end end)
+end
+
+-- ─────────────────────────────────────────────────────────
+--  REMOTE LISTENERS — Phantom / Infinity / ParrySuccess
+-- ─────────────────────────────────────────────────────────
+task.spawn(function()
+    local rems = ReplicatedStorage:WaitForChild("Remotes", 15)
+    if not rems then return end
+
+    -- Phantom
+    local ph = rems:FindFirstChild("Phantom")
+    if ph then
+        ph.OnClientEvent:Connect(function(_, b)
+            state.IsPhantom = b and b.Name == tostring(LP)
+        end)
+    end
+
+    -- Infinity Ball
+    local ib = rems:FindFirstChild("InfinityBall")
+    if ib then
+        ib.OnClientEvent:Connect(function(_, b)
+            state.InfinityBall = b
+        end)
+    end
+
+    -- ParrySuccess → accuracy
+    local ps = rems:FindFirstChild("ParrySuccess")
+    if ps then
+        ps.OnClientEvent:Connect(function()
+            SES.parry_success += 1
+            SES.streak += 1
+            if SES.streak > SES.streak_best then SES.streak_best = SES.streak end
+            SES.last_ok = true
+            saveStats()
+        end)
+    end
+end)
+
+-- ─────────────────────────────────────────────────────────
+--  BALL FINDER
+-- ─────────────────────────────────────────────────────────
+local BallsFolder = nil
+task.spawn(function() BallsFolder = workspace:WaitForChild("Balls",60) end)
+
+local function getBall()
+    if BallsFolder then
+        for _, b in ipairs(BallsFolder:GetChildren()) do
+            if b:IsA("BasePart") then return b end
+        end
+    end
+    for _, v in ipairs(workspace:GetDescendants()) do
+        if v:IsA("BasePart") and v.Name:lower():find("ball")
+            and v.Size.Magnitude < 6
+            and v.AssemblyLinearVelocity.Magnitude > 0.5 then
+            return v
+        end
+    end
+end
+
+local function getBallVelocity(ball)
+    local z = ball:FindFirstChild("zoomies")
+    if z then local ok,vv = pcall(function() return z.VectorVelocity end)
+        if ok and vv then return vv end end
+    return ball.AssemblyLinearVelocity
+end
+
+-- ─────────────────────────────────────────────────────────
+--  CURVED BALL DETECTION — dot history (Oxyo Hub method)
+-- ─────────────────────────────────────────────────────────
+local function updateDotHistory(ball, dot)
+    if not state.DotHistories[ball] then state.DotHistories[ball] = {} end
+    table.insert(state.DotHistories[ball], dot)
+    if #state.DotHistories[ball] > 5 then table.remove(state.DotHistories[ball],1) end
+end
+
+local function isCurved(ball)
+    local hist = state.DotHistories[ball]
+    if not hist or #hist < 3 then return false, false end
+    -- all dots positive → approaching but was going backwards = curved
+    local neg = 0
+    for _, d in ipairs(hist) do if d < 0 then neg+=1 end end
+    local backwardsDetected = neg >= 2
+    local curved = backwardsDetected
+    return curved, backwardsDetected
+end
+
+-- ─────────────────────────────────────────────────────────
+--  PARRY RANGE — Oxyo Hub verified formula
+--  speedDivisorBase = 2.4 + clamp(speed-9.5, 0, 820)*0.002
+--  speedDivisor = speedDivisorBase * SDMult
+--  parryAccuracy = adjustedPing + max(speed/speedDivisor, 9.5)
+--  curved correction applied if needed
+-- ─────────────────────────────────────────────────────────
+local function calcRange(speed, rawPing, curved, backwardsDetected)
+    local cappedDiff = math.min(math.max(speed - 9.5, 0), 820)
+    local divisorBase = 2.4 + cappedDiff * 0.002
+    local divisor = divisorBase * getSDMult()
+    local adjPing = rawPing / 10
+    if CFG.HighPingCompensation and rawPing > CFG.HighPingThreshold then
+        adjPing = adjPing * 1.5
+    end
+    local range = adjPing + math.max(speed / divisor, 9.5)
+
+    -- Curved reduction (Oxyo Hub table)
+    if curved and backwardsDetected then
+        local r = speed > 700 and 85 or speed > 600 and 75 or speed > 500 and 68 or speed > 400 and 62 or 55
+        range = range - r
+    elseif curved then
+        local r = speed > 700 and 58 or speed > 600 and 52 or speed > 500 and 46 or speed > 400 and 42 or 38
+        range = range - r
+    end
+    return math.max(range, 1)
+end
+
+-- ─────────────────────────────────────────────────────────
+--  CLOSEST ENEMY
+-- ─────────────────────────────────────────────────────────
+local closestEntity = nil
+
+local function updateClosest(fromPos)
+    if not Alive then return end
+    local best, bd = nil, math.huge
+    for _, e in ipairs(Alive:GetChildren()) do
+        if e.Name ~= LP.Name then
+            local hrp = e:FindFirstChild("HumanoidRootPart")
+            if hrp then
+                local d = (fromPos - hrp.Position).Magnitude
+                if d < bd then bd = d; best = e end
+            end
+        end
+    end
+    closestEntity = best
+end
+
+-- ─────────────────────────────────────────────────────────
+--  ABILITY CHECKS (Oxyo Hub method)
+-- ─────────────────────────────────────────────────────────
+local function checkAbilities(char)
+    local hotbar = LP.PlayerGui and LP.PlayerGui:FindFirstChild("Hotbar")
+    local abilities = char and char:FindFirstChild("Abilities")
+    local durationUI = hotbar and hotbar:FindFirstChild("Ability")
+        and hotbar.Ability:FindFirstChild("Duration")
+        and hotbar.Ability.Duration.Visible
+
+    -- Singularity Cape
+    local singCape = char and char.PrimaryPart
+        and char.PrimaryPart:FindFirstChild("SingularityCape")
+    if CFG.SingularityDetect and singCape then return true end
+
+    -- Infinity
+    local inf = abilities and abilities:FindFirstChild("Infinity")
+    if CFG.InfinityDetect and durationUI and inf and inf.Enabled and state.InfinityBall then
+        return true
+    end
+
+    -- Time Hole
+    local th = abilities and abilities:FindFirstChild("Time Hole")
+    if CFG.TimeHoleDetect and durationUI and th and th.Enabled then
+        return true
+    end
+
+    return false
+end
+
+-- ─────────────────────────────────────────────────────────
+--  FIRE PARRY — two signatures (AFGClient verified)
+-- ─────────────────────────────────────────────────────────
+local lastFireTime = 0
+
+local function fireParry(isSpam)
+    if not ParryRemote then return end
+    local now = tick()
+    if now - lastFireTime < CFG.SpamDelay then return end
+    lastFireTime = now
+
+    local tp, tn = Vector3.zero, ""
+    if closestEntity then
+        local hrp = closestEntity:FindFirstChild("HumanoidRootPart")
+        if hrp then tp = hrp.Position; tn = closestEntity.Name end
+    end
+
+    pcall(function()
+        if isSpam then
+            -- Spam: direction = Vector3.zero
+            ParryRemote:FireServer(0,
+                CFrame.new(Camera.CFrame.Position, Vector3.zero),
+                {[tn]=tp}, {tp.X, tp.Y}, false)
+        else
+            -- Parry: random direction (anti-detection)
+            ParryRemote:FireServer(0,
+                CFrame.new(Camera.CFrame.Position, Vector3.new(
+                    math.random(-1000,1000),
+                    math.random(0,1000),
+                    math.random(100,1000)
+                )),
+                {[tn]=tp}, {tp.X, tp.Y}, false)
+            SES.parry_fired += 1
+            saveStats()
+        end
+    end)
+end
+
+-- ─────────────────────────────────────────────────────────
+--  TORNADO / WINDFIELD DETECTION
+-- ─────────────────────────────────────────────────────────
+if Runtime then
+    Runtime.ChildAdded:Connect(function(v)
+        if v.Name == "Tornado" then
+            state.TornadoTime = tick()
+        end
+    end)
+end
+
+-- ─────────────────────────────────────────────────────────
+--  AUTO PRE-CLICK (TARGET SWAP PROTECTION ON PLAYER DEATH)
+-- ─────────────────────────────────────────────────────────
+local function trackDeathSlash()
+    if not Alive then return end
+    Alive.ChildRemoved:Connect(function(char)
+        if not CFG.AutoPreClick or not ParryRemote then return end
+        local ball = getBall()
+        if not ball then return end
+        local target = ball:GetAttribute("target")
+        if target == char.Name then
+            local bv = getBallVelocity(ball)
+            local speed = bv.Magnitude
+            if speed >= 200 then
+                local delay = math.random(120, 150) / 1000
+                task.delay(delay, function()
+                    local currentBall = getBall()
+                    if currentBall == ball and ball:GetAttribute("target") == tostring(LP) and not state.Parried then
+                        fireParry(false)
+                        state.Parried = true
+                        state.ParryTime = tick()
+                        task.delay(0.5, function() state.Parried = false end)
+                    end
+                end)
+            end
+        end
+    end)
+end
+task.spawn(trackDeathSlash)
+
+-- ─────────────────────────────────────────────────────────
+--  DRAWING — Visualizer
+-- ─────────────────────────────────────────────────────────
+local VIS = {}
+local function newDraw(t, props)
+    local ok, d = pcall(Drawing.new, t)
+    if not ok then return nil end
+    for k,v in pairs(props) do pcall(function() d[k]=v end) end
+    return d
+end
+VIS.BallCircle = newDraw("Circle",{Radius=14,Thickness=2,Color=CFG.ColApproach,Filled=false,Visible=false})
+VIS.TrajLine   = newDraw("Line",  {Thickness=2,Color=CFG.ColLine,Visible=false})
+VIS.PredDot    = newDraw("Circle",{Radius=6,Thickness=1,Color=CFG.ColPred,Filled=true,Visible=false})
+VIS.ConnLine   = newDraw("Line",  {Thickness=1,Color=Color3.new(1,1,1),Transparency=0.5,Visible=false})
+VIS.InfoText   = newDraw("Text",  {Size=13,Color=CFG.ColText,Outline=true,Visible=false})
+VIS.SubText    = newDraw("Text",  {Size=11,Color=Color3.fromRGB(180,130,255),Outline=true,Visible=false})
+VIS.AccText    = newDraw("Text",  {Size=12,Color=Color3.fromRGB(100,255,160),Outline=true,Visible=false})
+
+local function sv(d,p) if d then for k,v in pairs(p) do pcall(function() d[k]=v end) end end end
+local function hideVis() for _,d in pairs(VIS) do if d then pcall(function() d.Visible=false end) end end end
+
+local function updateVis(ball, hrp, bv, range, isTargeted, curved)
+    if not CFG.Visualizer or not ball or not hrp then hideVis(); return end
+    local spd  = bv.Magnitude
+    local dist = LP:DistanceFromCharacter(ball.Position)
+    local dir  = hrp.Position - ball.Position
+    local dot  = dir.Magnitude > 0 and dir.Unit:Dot(bv.Unit) or 0
+    local appr = dot > 0.05
+
+    -- TTA via quadratic
+    local tta = math.huge
+    if spd > 0.1 then
+        local rel = ball.Position - hrp.Position
+        local a,b,c_ = bv:Dot(bv), 2*rel:Dot(bv), rel:Dot(rel)-range*range
+        local dc = b*b - 4*a*c_
+        if dc >= 0 then
+            local sq = math.sqrt(dc)
+            local t1 = (-b-sq)/(2*a); local t2 = (-b+sq)/(2*a)
+            local t = math.huge
+            if t1 >= 0 then t=t1 end
+            if t2 >= 0 and t2<t then t=t2 end
+            tta = t
+        end
+    end
+
+    local pred = ball.Position + bv * math.min(tta,0.4)
+    local bp3,bOn = Camera:WorldToViewportPoint(ball.Position)
+    local pp3,pOn = Camera:WorldToViewportPoint(pred)
+    local ep3 = Camera:WorldToViewportPoint(hrp.Position)
+    local bp2 = Vector2.new(bp3.X,bp3.Y)
+    local pp2 = Vector2.new(pp3.X,pp3.Y)
+    local ep2 = Vector2.new(ep3.X,ep3.Y)
+
+    local col = isTargeted and Color3.fromRGB(255,30,30)
+        or curved and CFG.ColCurved
+        or (appr and CFG.ColApproach or CFG.ColAway)
+
+    sv(VIS.BallCircle,{Position=bp2,Color=col,Radius=math.clamp(18-bp3.Z*0.01,5,30),Visible=bOn})
+    sv(VIS.TrajLine,  {From=bp2,To=pp2,Visible=bOn and pOn})
+    sv(VIS.PredDot,   {Position=pp2,Visible=pOn and appr})
+    sv(VIS.ConnLine,  {From=ep2,To=bp2,Visible=bOn and isTargeted})
+    if bOn then
+        local ttaS = tta==math.huge and "—" or string.format("%.3fs",tta)
+        sv(VIS.InfoText,{
+            Text=string.format("DST:%.1f  SPD:%.0f  TTA:%s%s%s",
+                dist, spd, ttaS,
+                isTargeted and "  ◆" or "",
+                curved and "  CURVE" or ""),
+            Color=isTargeted and Color3.fromRGB(255,80,80) or CFG.ColText,
+            Position=Vector2.new(bp2.X-60,bp2.Y-40),Visible=true})
+        sv(VIS.SubText,{
+            Text=string.format("RNG:%.1f  ACC:%d%%  STK:%d",range,getAcc(),SES.streak),
+            Position=Vector2.new(bp2.X-50,bp2.Y+16),Visible=true})
+        sv(VIS.AccText,{
+            Text=string.format("MAX:%.0f  AVG:%.0f",SES.speed_max,SES.speed_avg),
+            Position=Vector2.new(bp2.X-40,bp2.Y+32),Visible=true})
+    else
+        sv(VIS.InfoText,{Visible=false})
+        sv(VIS.SubText, {Visible=false})
+        sv(VIS.AccText, {Visible=false})
+    end
+end
+
+-- ─────────────────────────────────────────────────────────
+--  ABILITY ESP
+-- ─────────────────────────────────────────────────────────
+local espLabels = {}
+
+local function createESPLabel(player)
+    if player == LP then return end
+    local char = player.Character or player.CharacterAdded:Wait()
+    local head = char:WaitForChild("Head", 5)
+    if not head then return end
+    local bg = Instance.new("BillboardGui")
+    bg.Name = "BB_AbilityESP"; bg.Parent = head
+    bg.Adornee = head; bg.AlwaysOnTop = true
+    bg.Size = UDim2.new(0,200,0,40)
+    bg.StudsOffset = Vector3.new(0,3,0)
+    local lbl = Instance.new("TextLabel", bg)
+    lbl.BackgroundTransparency=1; lbl.Size=UDim2.new(1,0,1,0)
+    lbl.TextColor3=Color3.fromRGB(255,215,0)
+    lbl.TextSize=16; lbl.Font=Enum.Font.GothamBold
+    espLabels[player] = lbl
+    local function upd()
+        local ab = player:GetAttribute("EquippedAbility")
+        lbl.Text = player.DisplayName..(ab and (" ["..ab.."]") or "")
+    end
+    upd()
+    player:GetAttributeChangedSignal("EquippedAbility"):Connect(upd)
+end
+
+local function toggleESP(on)
+    CFG.AbilityESP = on
+    if on then
+        for _, p in ipairs(Players:GetPlayers()) do createESPLabel(p) end
+        Players.PlayerAdded:Connect(createESPLabel)
+    else
+        for _, p in ipairs(Players:GetPlayers()) do
+            local l = espLabels[p]
+            if l and l.Parent then l.Parent:Destroy() end
+        end
+        espLabels = {}
+    end
+end
+
+-- ─────────────────────────────────────────────────────────
+--  OPTIMIZE (Oxyo Hub method)
+-- ─────────────────────────────────────────────────────────
+local function applyNoLag(on)
+    CFG.NoLag = on
+    if on then
+        Lighting.GlobalShadows = false
+        Lighting.FogEnd = 100000
+        Lighting.Brightness = 1
+        settings().Rendering.QualityLevel = Enum.QualityLevel.Level01
+        for _, obj in ipairs(game:GetDescendants()) do
+            if obj:IsA("ParticleEmitter") or obj:IsA("Trail") or obj:IsA("Beam")
+                or obj:IsA("Fire") or obj:IsA("Smoke") or obj:IsA("Sparkles") then
+                obj.Enabled = false
+            elseif obj:IsA("BlurEffect") or obj:IsA("SunRaysEffect")
+                or obj:IsA("BloomEffect") or obj:IsA("DepthOfFieldEffect") then
+                obj.Enabled = false
+            end
+        end
+    else
+        settings().Rendering.QualityLevel = Enum.QualityLevel.Automatic
+        Lighting.GlobalShadows = true
+    end
+end
+
+-- ─────────────────────────────────────────────────────────
+--  GUI
+-- ─────────────────────────────────────────────────────────
+local function buildGUI()
+    for _, g in ipairs(LP.PlayerGui:GetChildren()) do
+        if g.Name == "BB_Pro6" then g:Destroy() end
+    end
+    local sg = Instance.new("ScreenGui")
+    sg.Name = "BB_Pro6"; sg.ResetOnSpawn=false
+    sg.ZIndexBehavior=Enum.ZIndexBehavior.Sibling
+    sg.IgnoreGuiInset=true; sg.Parent=LP.PlayerGui
+
+    local function corner(p,r) local c=Instance.new("UICorner"); c.CornerRadius=UDim.new(0,r or 10); c.Parent=p end
+    local function lbl(par,props) local l=Instance.new("TextLabel",par); l.BackgroundTransparency=1; for k,v in pairs(props) do l[k]=v end; return l end
+    local function div(par,y,col) local d=Instance.new("Frame",par); d.Size=UDim2.new(1,-20,0,1); d.Position=UDim2.new(0,10,0,y); d.BackgroundColor3=col or Color3.fromRGB(60,20,140); d.BorderSizePixel=0 end
+
+    -- ── MAIN PANEL ──────────────────────────────────────
+    local main = Instance.new("Frame",sg)
+    main.Name="Main"; main.Size=UDim2.new(0,282,0,710)
+    main.Position=UDim2.new(0,14,0.5,-355)
+    main.BackgroundColor3=Color3.fromRGB(6,6,14)
+    main.BorderSizePixel=0; main.Active=true; main.Draggable=true
+    corner(main)
+    local stroke=Instance.new("UIStroke",main); stroke.Color=Color3.fromRGB(90,25,240)
+    local gr=Instance.new("UIGradient",main)
+    gr.Color=ColorSequence.new({ColorSequenceKeypoint.new(0,Color3.fromRGB(14,5,34)),ColorSequenceKeypoint.new(1,Color3.fromRGB(6,6,14))})
+    gr.Rotation=140
+
+    lbl(main,{Size=UDim2.new(1,-12,0,30),Position=UDim2.new(0,12,0,8),
+        Text="⚔  BLADE BALL  PRO",TextColor3=Color3.fromRGB(160,65,255),
+        Font=Enum.Font.GothamBold,TextSize=18,TextXAlignment=Enum.TextXAlignment.Left})
+    lbl(main,{Size=UDim2.new(1,-12,0,14),Position=UDim2.new(0,14,0,36),
+        Text="v7.0  •  Oxyo Hub + AFGClient verified",
+        TextColor3=Color3.fromRGB(65,45,110),Font=Enum.Font.Gotham,TextSize=11,
+        TextXAlignment=Enum.TextXAlignment.Left})
+    div(main, 54)
+
+    local function toggle(text, yOff, cfgKey, cb)
+        local row=Instance.new("Frame",main)
+        row.Size=UDim2.new(1,-20,0,36); row.Position=UDim2.new(0,10,0,yOff)
+        row.BackgroundColor3=Color3.fromRGB(11,11,22); row.BorderSizePixel=0; corner(row,7)
+        lbl(row,{Size=UDim2.new(0.68,0,1,0),Position=UDim2.new(0,10,0,0),
+            Text=text,TextColor3=Color3.fromRGB(210,210,225),
+            Font=Enum.Font.Gotham,TextSize=12,TextXAlignment=Enum.TextXAlignment.Left})
+        local bg=Instance.new("Frame",row)
+        bg.Size=UDim2.new(0,44,0,22); bg.Position=UDim2.new(1,-54,0.5,-11)
+        bg.BackgroundColor3=CFG[cfgKey] and Color3.fromRGB(100,25,250) or Color3.fromRGB(36,36,52)
+        bg.BorderSizePixel=0; corner(bg,11)
+        local knob=Instance.new("Frame",bg)
+        knob.Size=UDim2.new(0,18,0,18)
+        knob.Position=CFG[cfgKey] and UDim2.new(1,-20,0.5,-9) or UDim2.new(0,2,0.5,-9)
+        knob.BackgroundColor3=Color3.new(1,1,1); knob.BorderSizePixel=0; corner(knob,9)
+        local btn=Instance.new("TextButton",bg)
+        btn.Size=UDim2.new(1,0,1,0); btn.BackgroundTransparency=1; btn.Text=""
+        btn.MouseButton1Click:Connect(function()
+            CFG[cfgKey]=not CFG[cfgKey]; local on=CFG[cfgKey]
+            TweenService:Create(bg,TweenInfo.new(0.15),{BackgroundColor3=on and Color3.fromRGB(100,25,250) or Color3.fromRGB(36,36,52)}):Play()
+            TweenService:Create(knob,TweenInfo.new(0.15),{Position=on and UDim2.new(1,-20,0.5,-9) or UDim2.new(0,2,0.5,-9)}):Play()
+            if cb then cb(on) end
+        end)
+    end
+
+    local function slider(text, yOff, cfgKey, minVal, maxVal, cb)
+        local row = Instance.new("Frame", main)
+        row.Size = UDim2.new(1, -20, 0, 42); row.Position = UDim2.new(0, 10, 0, yOff)
+        row.BackgroundColor3 = Color3.fromRGB(11, 11, 22); row.BorderSizePixel = 0; corner(row, 7)
+        
+        lbl(row, {Size = UDim2.new(0.6, 0, 0.5, 0), Position = UDim2.new(0, 10, 0, 4),
+            Text = text, TextColor3 = Color3.fromRGB(210, 210, 225),
+            Font = Enum.Font.Gotham, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left})
+            
+        local valLbl = lbl(row, {Size = UDim2.new(0.35, 0, 0.5, 0), Position = UDim2.new(0.6, -10, 0, 4),
+            Text = tostring(CFG[cfgKey]), TextColor3 = Color3.fromRGB(160, 65, 255),
+            Font = Enum.Font.GothamBold, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Right})
+            
+        local slideBG = Instance.new("Frame", row)
+        slideBG.Size = UDim2.new(1, -20, 0, 6); slideBG.Position = UDim2.new(0, 10, 0.7, 0)
+        slideBG.BackgroundColor3 = Color3.fromRGB(36, 36, 52); slideBG.BorderSizePixel = 0; corner(slideBG, 3)
+        
+        local slideFill = Instance.new("Frame", slideBG)
+        local pct = (CFG[cfgKey] - minVal) / (maxVal - minVal)
+        slideFill.Size = UDim2.new(pct, 0, 1, 0)
+        slideFill.BackgroundColor3 = Color3.fromRGB(100, 25, 250); slideFill.BorderSizePixel = 0; corner(slideFill, 3)
+        
+        local active = false
+        local function update(input)
+            local x = math.clamp((input.Position.X - slideBG.AbsolutePosition.X) / slideBG.AbsoluteSize.X, 0, 1)
+            slideFill.Size = UDim2.new(x, 0, 1, 0)
+            local val = math.round(minVal + x * (maxVal - minVal))
+            CFG[cfgKey] = val
+            valLbl.Text = tostring(val)
+            if cb then cb(val) end
+        end
+        
+        slideBG.InputBegan:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+                active = true
+                update(input)
+            end
+        end)
+        UserInputService.InputChanged:Connect(function(input)
+            if active and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+                update(input)
+            end
+        end)
+        UserInputService.InputEnded:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+                active = false
+            end
+        end)
+    end
+
+    -- Section label
+    local function sec(text, y)
+        lbl(main,{Size=UDim2.new(1,-20,0,14),Position=UDim2.new(0,10,0,y),
+            Text="  "..text,TextColor3=Color3.fromRGB(110,60,200),
+            Font=Enum.Font.GothamBold,TextSize=10,TextXAlignment=Enum.TextXAlignment.Left})
+    end
+
+    -- COMBAT
+    sec("COMBAT", 60)
+    toggle("Auto Parry",  76,  "AutoParry", nil)
+    toggle("Auto Spam",   116, "AutoSpam",  nil)
+    slider("Parry Accuracy", 156, "ParryAccuracy", 1, 100, nil)
+
+    -- DETECTION
+    div(main, 206, Color3.fromRGB(40,10,80))
+    sec("ABILITY DETECTION", 212)
+    toggle("Singularity Detection", 228, "SingularityDetect", nil)
+    toggle("Infinity Detection",    268, "InfinityDetect",    nil)
+    toggle("Time Hole Detection",   308, "TimeHoleDetect",    nil)
+    toggle("Anti-Phantom",          348, "AntiPhantom",       nil)
+    toggle("Anti-Tornado",          388, "TornadoDetect",     nil)
+    toggle("Auto Pre-Click",        428, "AutoPreClick",      nil)
+
+    -- VISUAL
+    div(main, 470, Color3.fromRGB(40,10,80))
+    sec("VISUAL & MISC", 476)
+    toggle("Visualizer",   492, "Visualizer",  function(on) if not on then hideVis() end end)
+    toggle("Ability ESP",  532, "AbilityESP",  function(on) toggleESP(on) end)
+    toggle("No Lag",       572, "NoLag",        function(on) applyNoLag(on) end)
+    toggle("High Ping Comp",612,"HighPingCompensation",nil)
+    
+    -- Status strip
+    local stBG=Instance.new("Frame",sg)
+    stBG.Size=UDim2.new(0,282,0,26); stBG.Position=UDim2.new(0,14,0.5,358)
+    stBG.BackgroundColor3=Color3.fromRGB(8,16,8); stBG.BorderSizePixel=0; corner(stBG,6)
+    local stLbl=lbl(stBG,{Name="Status",Size=UDim2.new(1,0,1,0),
+        Text="● Remote aranıyor...",TextColor3=Color3.fromRGB(255,195,45),
+        Font=Enum.Font.GothamBold,TextSize=12})
+
+    -- ── HUD OVERLAY ──────────────────────────────────────
+    local hud = Instance.new("Frame", sg)
+    hud.Name = "HUD"
+    hud.Size = UDim2.new(0, 220, 0, 80)
+    hud.Position = UDim2.new(1, -230, 0, 14) -- Top-right corner
+    hud.BackgroundColor3 = Color3.fromRGB(6, 6, 14)
+    hud.BackgroundTransparency = 0.3
+    hud.BorderSizePixel = 0
+    corner(hud, 8)
+    local hudStroke = Instance.new("UIStroke", hud)
+    hudStroke.Color = Color3.fromRGB(90, 25, 240)
+    hudStroke.Thickness = 1
+    
+    local hudLabel = lbl(hud, {
+        Size = UDim2.new(1, -20, 1, -10),
+        Position = UDim2.new(0, 10, 0, 5),
+        Text = "⚽ Top Hızı: —\n⚡ Peak Hız: —\n🎯 Hedef: —\n⏱ TTA: —",
+        TextColor3 = Color3.fromRGB(255, 255, 255),
+        Font = Enum.Font.GothamBold,
+        TextSize = 13,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextYAlignment = Enum.TextYAlignment.Center
+    })
+    
+    toggle("Show HUD", 650, "ShowHUD", function(on) hud.Visible = on end)
+
+    div(main, 694, Color3.fromRGB(40,10,80))
+    lbl(main,{Size=UDim2.new(1,-20,0,12),Position=UDim2.new(0,10,0,696),
+        Text="[E] Spam  [Insert] GUI  [Tab] Stats",
+        TextColor3=Color3.fromRGB(70,48,120),Font=Enum.Font.Gotham,TextSize=10})
+
+    -- ── STATS PANEL ─────────────────────────────────────
+    local stats=Instance.new("Frame",sg)
+    stats.Name="Stats"; stats.Size=UDim2.new(0,304,0,310)
+    stats.Position=UDim2.new(0,310,0.5,-155)
+    stats.BackgroundColor3=Color3.fromRGB(4,4,14)
+    stats.BorderSizePixel=0; stats.Active=true; stats.Draggable=true
+    stats.Visible=false; corner(stats)
+    Instance.new("UIStroke",stats).Color=Color3.fromRGB(45,200,115)
+    local sg2=Instance.new("UIGradient",stats)
+    sg2.Color=ColorSequence.new({ColorSequenceKeypoint.new(0,Color3.fromRGB(5,20,14)),ColorSequenceKeypoint.new(1,Color3.fromRGB(4,4,14))})
+    sg2.Rotation=140
+
+    lbl(stats,{Size=UDim2.new(1,-12,0,26),Position=UDim2.new(0,12,0,6),
+        Text="📊  STATISTICS",TextColor3=Color3.fromRGB(45,230,120),
+        Font=Enum.Font.GothamBold,TextSize=15,TextXAlignment=Enum.TextXAlignment.Left})
+    div(stats,36,Color3.fromRGB(18,75,45))
+
+    local sRows={}
+    local function sRow(name,yOff,col)
+        lbl(stats,{Size=UDim2.new(0.47,0,0,20),Position=UDim2.new(0,12,0,yOff),
+            Text=name,TextColor3=Color3.fromRGB(130,135,155),
+            Font=Enum.Font.Gotham,TextSize=12,TextXAlignment=Enum.TextXAlignment.Left})
+        local vl=lbl(stats,{Name=name,Size=UDim2.new(0.50,0,0,20),
+            Position=UDim2.new(0.48,0,0,yOff),
+            Text="—",TextColor3=col or Color3.fromRGB(220,220,255),
+            Font=Enum.Font.GothamBold,TextSize=12,TextXAlignment=Enum.TextXAlignment.Right})
+        sRows[name]=vl
+    end
+    sRow("Session",       42,  Color3.fromRGB(200,200,100))
+    sRow("Accuracy",      64,  Color3.fromRGB(100,255,160))
+    sRow("Fired",         86,  Color3.fromRGB(200,150,255))
+    sRow("Success",       108, Color3.fromRGB(100,255,120))
+    sRow("Miss",          130, Color3.fromRGB(255,120,100))
+    sRow("Streak",        152, Color3.fromRGB(255,220,50))
+    sRow("Best Streak",   174, Color3.fromRGB(255,200,30))
+    div(stats,198,Color3.fromRGB(18,75,45))
+    sRow("Speed Now",     204, Color3.fromRGB(100,200,255))
+    sRow("Speed Avg",     226, Color3.fromRGB(80,180,255))
+    sRow("Speed Max",     248, Color3.fromRGB(255,100,100))
+    div(stats,274,Color3.fromRGB(18,75,45))
+    sRow("Ping",          280, Color3.fromRGB(180,255,180))
+
+    -- Speed bar
+    local barBG=Instance.new("Frame",stats)
+    barBG.Size=UDim2.new(1,-24,0,6); barBG.Position=UDim2.new(0,12,0,304)
+    barBG.BackgroundColor3=Color3.fromRGB(18,18,28); barBG.BorderSizePixel=0; corner(barBG,3)
+    local barFill=Instance.new("Frame",barBG)
+    barFill.Name="Bar"; barFill.Size=UDim2.new(0,0,1,0)
+    barFill.BackgroundColor3=Color3.fromRGB(100,200,255); barFill.BorderSizePixel=0; corner(barFill,3)
+
+    return sg, stLbl, stats, sRows, barFill, hud, hudLabel
+end
+
+local GUI, StatusLabel, StatsPanel, StatRows, SpeedBar, HUDFrame, HUDLabel = buildGUI()
+
+-- Stats updater
+local function refreshStats(rawPing)
+    local miss = math.max(0, SES.parry_fired - SES.parry_success)
+    local acc  = getAcc()
+    if StatRows["Session"]    then StatRows["Session"].Text    = sesTime() end
+    if StatRows["Accuracy"]   then
+        StatRows["Accuracy"].Text = acc.."%"
+        StatRows["Accuracy"].TextColor3 = acc>=80 and Color3.fromRGB(50,255,120)
+            or acc>=50 and Color3.fromRGB(255,200,50) or Color3.fromRGB(255,80,80) end
+    if StatRows["Fired"]      then StatRows["Fired"].Text      = tostring(SES.parry_fired) end
+    if StatRows["Success"]    then StatRows["Success"].Text    = tostring(SES.parry_success) end
+    if StatRows["Miss"]       then StatRows["Miss"].Text       = tostring(miss) end
+    if StatRows["Streak"]     then StatRows["Streak"].Text     = tostring(SES.streak) end
+    if StatRows["Best Streak"]then StatRows["Best Streak"].Text= tostring(SES.streak_best) end
+    if StatRows["Speed Now"]  then StatRows["Speed Now"].Text  = string.format("%.0f st/s",SES.speed_current) end
+    if StatRows["Speed Avg"]  then StatRows["Speed Avg"].Text  = string.format("%.0f st/s",SES.speed_avg) end
+    if StatRows["Speed Max"]  then StatRows["Speed Max"].Text  = string.format("%.0f st/s",SES.speed_max) end
+    if StatRows["Ping"]       then StatRows["Ping"].Text       = string.format("%.0f ms",rawPing) end
+    if SpeedBar and SES.speed_max > 0 then
+        local pct = math.clamp(SES.speed_current/SES.speed_max,0,1)
+        TweenService:Create(SpeedBar,TweenInfo.new(0.1),{Size=UDim2.new(pct,0,1,0)}):Play()
+        SpeedBar.BackgroundColor3 = pct>0.75 and Color3.fromRGB(255,80,80)
+            or pct>0.4 and Color3.fromRGB(255,180,50) or Color3.fromRGB(100,200,255)
+    end
+end
+
+-- Keybinds
+UserInputService.InputBegan:Connect(function(inp, gp)
+    if gp then return end
+    if inp.KeyCode == Enum.KeyCode.Insert then
+        local m = GUI:FindFirstChild("Main"); if m then m.Visible=not m.Visible end
+    end
+    if inp.KeyCode == Enum.KeyCode.Tab then
+        if StatsPanel then StatsPanel.Visible=not StatsPanel.Visible end
+    end
+end)
+
+if CFG.NoLag then applyNoLag(true) end
+
+-- ─────────────────────────────────────────────────────────
+--  ANA LOOP — PreSimulation (Oxyo Hub uses PreSimulation)
+-- ─────────────────────────────────────────────────────────
+RunService.PreSimulation:Connect(function()
+    local char = LP.Character
+    if not char then return end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not hrp or not hum or hum.Health <= 0 then return end
+
+    local ball = getBall()
+    if not ball then
+        if HUDFrame and HUDFrame.Visible then
+            HUDLabel.RichText = true
+            HUDLabel.Text = "⚽ <font color=\"rgb(100,200,255)\">Top Hızı:</font> —\n⚡ <font color=\"rgb(255,200,50)\">Peak Hız:</font> —\n🎯 <font color=\"rgb(255,255,255)\">Hedef:</font> —\n⏱ <font color=\"rgb(180,130,255)\">TTA:</font> —"
+        end
+        hideVis()
+        return
+    end
+
+    -- Ball velocity
+    local bv    = getBallVelocity(ball)
+    local speed = bv.Magnitude
+    local rawPing = getRawPing()
+
+    recordSpeed(speed)
+
+    -- Future position (Oxyo Hub method)
+    local dt      = rawPing / 2000
+    local ballFut = ball.Position + bv * dt
+    local hrpFut  = hrp.Position + hrp.AssemblyLinearVelocity * dt
+    local dist    = (hrpFut - ballFut).Magnitude   -- ping-aware distance
+
+    -- Targeted?
+    local isTargeted = ball:GetAttribute("target") == tostring(LP)
+
+    -- Dot + curved detection
+    local dir = hrp.Position - ball.Position
+    local dot = dir.Magnitude > 0 and dir.Unit:Dot(bv.Unit) or 0
+    updateDotHistory(ball, dot)
+    local curved, backwardsDetected = isCurved(ball)
+
+    -- Velocity history
+    if not state.VelHistories[ball] then state.VelHistories[ball] = {} end
+    table.insert(state.VelHistories[ball], bv)
+    if #state.VelHistories[ball] > 5 then table.remove(state.VelHistories[ball],1) end
+
+    -- Parry range
+    local range = calcRange(speed, rawPing, curved, backwardsDetected)
+
+    -- Visualizer
+    updateVis(ball, hrp, bv, range, isTargeted, curved)
+
+    -- HUD Overlay Updater
+    if HUDFrame and HUDFrame.Visible then
+        local tta = math.huge
+        if speed > 0.1 then
+            local rel = ball.Position - hrp.Position
+            local a,b,c_ = bv:Dot(bv), 2*rel:Dot(bv), rel:Dot(rel)-range*range
+            local dc = b*b - 4*a*c_
+            if dc >= 0 then
+                local sq = math.sqrt(dc)
+                local t1 = (-b-sq)/(2*a); local t2 = (-b+sq)/(2*a)
+                local t = math.huge
+                if t1 >= 0 then t=t1 end
+                if t2 >= 0 and t2<t then t=t2 end
+                tta = t
+            end
+        end
+
+        local targetName = ball:GetAttribute("target") or "Yok"
+        local targetColor = isTargeted and "rgb(255,55,55)" or "rgb(255,255,255)"
+        local ttaDisplay = tta == math.huge and "—" or string.format("%.3fs", tta)
+        
+        HUDLabel.RichText = true
+        HUDLabel.Text = string.format(
+            "⚽ <font color=\"rgb(100,200,255)\">Top Hızı:</font> %d st/s\n⚡ <font color=\"rgb(255,200,50)\">Peak Hız:</font> %d st/s\n🎯 <font color=\"%s\">Hedef:</font> %s\n⏱ <font color=\"rgb(180,130,255)\">TTA:</font> %s",
+            math.floor(speed),
+            math.floor(SES.speed_max),
+            targetColor,
+            targetName,
+            ttaDisplay
+        )
+    end
+
+    if not CFG.AutoParry or speed < 0.5 then return end
+    if not isTargeted then return end
+    if state.Parried then return end
+
+    -- Ability checks (skip parry if ability active)
+    if checkAbilities(char) then return end
+
+    -- Tornado / Windfield Check
+    if CFG.TornadoDetect then
+        local tornado = Runtime and Runtime:FindFirstChild("Tornado")
+        if ball:FindFirstChild("AeroDynamicSlashVFX") then
+            pcall(function() Debris:AddItem(ball.AeroDynamicSlashVFX, 0) end)
+            state.TornadoTime = tick()
+        end
+        if tornado then
+            local elapsedTornado = tick() - state.TornadoTime
+            local tornadoDuration = (tornado:GetAttribute("TornadoTime") or 1) + 0.314
+            if elapsedTornado < tornadoDuration then return end
+        end
+    end
+
+    -- Predicted dot (Oxyo Hub: skip if predicted_dot < -0.3)
+    local predDir = (hrpFut - ballFut)
+    local predDot = predDir.Magnitude > 0 and predDir.Unit:Dot(bv.Unit) or 0
+    if predDot < -0.3 then return end
+
+    -- Closest enemy
+    updateClosest(hrp.Position)
+
+    -- TRIGGER
+    if dist <= range and ParryRemote then
+        fireParry(false)
+        state.Parried = true
+        state.ParryTime = tick()
+        state.Parries += 1
+        task.delay(0.5, function()
+            state.Parries = math.max(0, state.Parries - 1)
+        end)
+
+        -- Reset after 1 second (Oxyo Hub: PreSimulation wait)
+        task.spawn(function()
+            repeat RunService.PreSimulation:Wait()
+            until (tick() - state.ParryTime) >= 1 or not state.Parried
+            state.Parried = false
+            if not SES.last_ok then SES.streak = 0 end
+            SES.last_ok = false
+        end)
+
+        -- Reset on ball target change (Oxyo Hub method)
+        ball:GetAttributeChangedSignal("target"):Once(function()
+            state.Parried = false
+        end)
+    end
+end)
+
+-- Ball removed → full state reset
+task.spawn(function()
+    if not BallsFolder then BallsFolder = workspace:WaitForChild("Balls",60) end
+    if BallsFolder then
+        BallsFolder.ChildRemoved:Connect(function(b)
+            state.Parried = false
+            state.DotHistories[b] = nil
+            state.VelHistories[b] = nil
+            state.WasBackwards[b] = nil
+        end)
+    end
+end)
+
+-- Auto Spam Heartbeat
+RunService.Heartbeat:Connect(function()
+    if CFG.AutoSpam and ParryRemote then fireParry(true) end
+end)
+
+-- Manuel Spam
+local manualActive = false
+UserInputService.InputBegan:Connect(function(inp, gp)
+    if gp then return end
+    if inp.KeyCode == CFG.ManualSpamKey and not manualActive then
+        manualActive = true
+        task.spawn(function()
+            while manualActive do fireParry(true); task.wait(CFG.SpamDelay) end
+        end)
+    end
+end)
+UserInputService.InputEnded:Connect(function(inp)
+    if inp.KeyCode == CFG.ManualSpamKey then manualActive=false end
+end)
+
+-- ─────────────────────────────────────────────────────────
+--  STATUS LOOP
+-- ─────────────────────────────────────────────────────────
+task.spawn(function()
+    while true do
+        task.wait(0.4)
+        local rp = getRawPing()
+        -- Status bar
+        if StatusLabel and StatusLabel.Parent then
+            if not ParryRemote then
+                StatusLabel.Text="● Remote aranıyor..."; StatusLabel.TextColor3=Color3.fromRGB(255,195,45)
+            elseif CFG.AutoSpam then
+                StatusLabel.Text="🔴 AUTO SPAM  |  ACC:"..getAcc().."%" ; StatusLabel.TextColor3=Color3.fromRGB(255,55,55)
+            elseif CFG.AutoParry then
+                StatusLabel.Text="🟢 AUTO PARRY  |  ACC:"..getAcc().."%  STK:"..SES.streak ; StatusLabel.TextColor3=Color3.fromRGB(55,255,95)
+            else
+                StatusLabel.Text="⚪ Beklemede"; StatusLabel.TextColor3=Color3.fromRGB(140,140,140)
+            end
+        end
+        if StatsPanel and StatsPanel.Visible then refreshStats(rp) end
+    end
+end)
+
+-- ─────────────────────────────────────────────────────────
+--  CLEANUP
+-- ─────────────────────────────────────────────────────────
+LP.CharacterAdded:Connect(function()
+    state.Parried=false; state.Parries=0
+    state.DotHistories={}; state.VelHistories={}; state.WasBackwards={}
+    closestEntity=nil; SES.streak=0
+end)
+
+-- ─────────────────────────────────────────────────────────
+print("╔══════════════════════════════════════════════════╗")
+print("║   Blade Ball PRO v7.0 Ultimate yüklendi!         ║")
+print("║   Kasırga & Otomatik Ön-Tıklama Korumaları Aktif  ║")
+print("║   [Tab] Stats  [E] Spam  [Insert] GUI            ║")
+print("╚══════════════════════════════════════════════════╝")
