@@ -1,15 +1,17 @@
 --[[
     ╔══════════════════════════════════════════════════════════════╗
-    ║       BLADE BALL — ULTIMATE PRO SCRIPT v8.6                  ║
+    ║       BLADE BALL — ULTIMATE PRO SCRIPT v8.7                  ║
     ║                                                              ║
     ║   Features:                                                  ║
     ║   • Parry Remote: dual hookmetamethod & hookfunction         ║
     ║   • Dynamic Remote Interceptor (Input Correlation)           ║
+    ║   • RemoteEvent & RemoteFunction Capture Support             ║
+    ║   • Auto Aim (Horizontal Look-At facing validation)          ║
+    ║   • Model Ball Resolution & Velocity Fallbacks               ║
     ║   • Triple-Redundant Parry (Remote + GUI Click + VIM)        ║
     ║   • Wall Bounce Raycast Prediction (Masterpiece)             ║
     ║   • Curved Ball Tracking (Homing TTA Fallback)               ║
     ║   • Singularity Cape / Infinity / Time Hole Detection        ║
-    ║   • Phantom Detection                                        ║
     ║   • Statistics Panel (speed, accuracy, streak, persistent)   ║
     ║   • Visualizer (TTA, range, curved)                          ║
     ║   • Anti-Tornado & Auto Pre-Click (Target Swap)              ║
@@ -57,6 +59,7 @@ local CFG = {
     -- Core
     AutoParry          = true,
     AutoSpam           = false,
+    AutoAim            = true,
     ManualSpamKey      = Enum.KeyCode.E,
     SpamDelay          = 0.03,
     -- Accuracy slider (1–100)
@@ -194,71 +197,60 @@ UserInputService.InputBegan:Connect(function(input, gp)
 end)
 
 local function secureHooks()
-    if typeof(hookmetamethod) ~= "function" then return end
-    
-    local oldNameCall
-    oldNameCall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
-        local method = getnamecallmethod()
-        local args = {...}
+    local function processRemote(self, args)
+        local name = self.Name:lower()
+        if name:find("parry") or name:find("deflect") or name:find("block") or name:find("hit") or name:find("swing") or name:find("press") then
+            if not ParryRemote then
+                ParryRemote = self
+                ParryArgs = args
+            end
+        end
         
-        if method == "FireServer" and self:IsA("RemoteEvent") then
-            local name = self.Name:lower()
-            
-            -- String matching detection
-            if name:find("parry") or name:find("deflect") or name:find("block") or name:find("hit") or name:find("swing") or name:find("press") then
+        local now = tick()
+        if state.LastPlayerInputTime and (now - state.LastPlayerInputTime) < 0.1 then
+            if not name:find("chat") and not name:find("ping") and not name:find("log") and not name:find("teleport") then
                 if not ParryRemote then
                     ParryRemote = self
                     ParryArgs = args
                 end
             end
-            
-            -- Input-correlation detection (masterpiece bypass)
-            local now = tick()
-            if state.LastPlayerInputTime and (now - state.LastPlayerInputTime) < 0.1 then
-                if not name:find("chat") and not name:find("ping") and not name:find("log") and not name:find("teleport") then
-                    if not ParryRemote then
-                        ParryRemote = self
-                        ParryArgs = args
-                    end
-                end
-            end
         end
-        
-        -- Bypass kick detections safely
-        if method == "Kick" and self == LP then
-            warn("[BB] Game tried to kick the player!")
-            return task.wait(9e9)
-        end
-        
-        return oldNameCall(self, unpack(args))
-    end))
-    
-    -- Dual hook function for executors without proper __namecall support
-    if typeof(hookfunction) == "function" then
-        local r = Instance.new("RemoteEvent")
-        local oldFireServer
-        oldFireServer = hookfunction(r.FireServer, newcclosure(function(self, ...)
-            local name = self.Name:lower()
+    end
+
+    if typeof(hookmetamethod) == "function" then
+        local oldNameCall
+        oldNameCall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
+            local method = getnamecallmethod()
             local args = {...}
             
-            if name:find("parry") or name:find("deflect") or name:find("block") or name:find("hit") or name:find("swing") or name:find("press") then
-                if not ParryRemote then
-                    ParryRemote = self
-                    ParryArgs = args
-                end
+            if (method == "FireServer" and self:IsA("RemoteEvent")) or (method == "InvokeServer" and self:IsA("RemoteFunction")) then
+                processRemote(self, args)
             end
             
-            local now = tick()
-            if state.LastPlayerInputTime and (now - state.LastPlayerInputTime) < 0.1 then
-                if not name:find("chat") and not name:find("ping") and not name:find("log") and not name:find("teleport") then
-                    if not ParryRemote then
-                        ParryRemote = self
-                        ParryArgs = args
-                    end
-                end
+            if method == "Kick" and self == LP then
+                warn("[BB] Game tried to kick the player!")
+                return task.wait(9e9)
             end
-            return oldFireServer(self, unpack(args))
+            
+            return oldNameCall(self, unpack(args))
         end))
+    end
+    
+    if typeof(hookfunction) == "function" then
+        local oldFireServer
+        oldFireServer = hookfunction(Instance.new("RemoteEvent").FireServer, newcclosure(function(self, ...)
+            processRemote(self, {...})
+            return oldFireServer(self, ...)
+        end))
+        
+        pcall(function()
+            local rf = Instance.new("RemoteFunction")
+            local oldInvokeServer
+            oldInvokeServer = hookfunction(rf.InvokeServer, newcclosure(function(self, ...)
+                processRemote(self, {...})
+                return oldInvokeServer(self, ...)
+            end))
+        end)
     end
 end
 task.spawn(pcall, secureHooks)
@@ -274,7 +266,7 @@ local function scanForRemote()
     for _, folder in ipairs(targetFolders) do
         if folder then
             for _, v in ipairs(folder:GetChildren()) do
-                if v:IsA("RemoteEvent") then
+                if v:IsA("RemoteEvent") or v:IsA("RemoteFunction") then
                     local n = v.Name:lower()
                     if n:find("parry") or n:find("deflect") or n:find("block")
                         or n:find("swing") or n:find("hit") or n:find("bounce") then
@@ -291,7 +283,7 @@ local function scanForRemote()
     for _, v in ipairs(ReplicatedStorage:GetDescendants()) do
         count = count + 1
         if count % 200 == 0 then task.wait() end
-        if v:IsA("RemoteEvent") then
+        if v:IsA("RemoteEvent") or v:IsA("RemoteFunction") then
             local n = v.Name:lower()
             if n:find("parry") or n:find("deflect") or n:find("block")
                 or n:find("swing") or n:find("hit") or n:find("bounce") then
@@ -344,23 +336,43 @@ end)
 -- ─────────────────────────────────────────────────────────
 --  BALL FINDER & VELOCITY
 -- ─────────────────────────────────────────────────────────
+local function resolveBallPart(inst)
+    if not inst then return nil end
+    if inst:IsA("BasePart") then
+        local name = inst.Name:lower()
+        if not name:find("ring") and not name:find("visual") and not name:find("aura") then
+            return inst
+        end
+    end
+    if inst:IsA("Model") then
+        if inst.PrimaryPart then return inst.PrimaryPart end
+        for _, child in ipairs(inst:GetChildren()) do
+            if child:IsA("BasePart") then return child end
+        end
+    end
+    return nil
+end
+
 local function getBall()
     if BallsFolder then
-        for _, b in ipairs(BallsFolder:GetChildren()) do
-            if b:IsA("BasePart") then return b end
+        for _, child in ipairs(BallsFolder:GetChildren()) do
+            local bp = resolveBallPart(child)
+            if bp then return bp end
         end
     end
-    local bf = workspace:FindFirstChild("Balls")
+    local bf = workspace:FindFirstChild("Balls") or workspace:FindFirstChild("BallsFolder")
     if bf then
         BallsFolder = bf
-        for _, b in ipairs(bf:GetChildren()) do
-            if b:IsA("BasePart") then return b end
+        for _, child in ipairs(bf:GetChildren()) do
+            local bp = resolveBallPart(child)
+            if bp then return bp end
         end
     end
-    for _, b in ipairs(workspace:GetChildren()) do
-        if b:IsA("BasePart") then
-            local n = b.Name:lower()
-            if n:find("ball") or n:find("sphere") then return b end
+    for _, child in ipairs(workspace:GetChildren()) do
+        local bp = resolveBallPart(child)
+        if bp then
+            local n = bp.Name:lower()
+            if n:find("ball") or n:find("sphere") then return bp end
         end
     end
     return nil
@@ -375,7 +387,9 @@ local function getBallVelocity(ball)
         if ok2 and vv2 then return vv2 end
     end
     local ok, vel = pcall(function() return ball.AssemblyLinearVelocity end)
-    if ok and vel then return vel end
+    if ok and vel and vel.Magnitude > 0.1 then return vel end
+    local ok2, vel2 = pcall(function() return ball.Velocity end)
+    if ok2 and vel2 then return vel2 end
     return Vector3.zero
 end
 
@@ -424,8 +438,6 @@ local function getAbsoluteTTA(ball, hrp, bv)
     if bounced then
         local distToWall = (hitPos - bp).Magnitude
         local distFromWall = (pp - hitPos).Magnitude
-        
-        -- total time = path distance / speed
         return (distToWall + distFromWall) / speed
     end
     
@@ -502,7 +514,6 @@ local function calcRange(speed, rawPing, curved, avgAngle)
     local range = adjPing + math.max(speed / divisor, 9.5)
 
     if curved then
-        -- Scale range reduction dynamically with curved angle severity
         local curveReductionFactor = math.clamp(avgAngle / 16, 0.15, 0.45)
         range = range * (1 - curveReductionFactor)
     end
@@ -517,7 +528,7 @@ local function calcRange(speed, rawPing, curved, avgAngle)
 end
 
 -- ─────────────────────────────────────────────────────────
---  CLOSEST ENEMY
+--  CLOSEST ENEMY & AUTO AIM
 -- ─────────────────────────────────────────────────────────
 local closestEntity = nil
 
@@ -535,6 +546,16 @@ local function updateClosest(fromPos)
         end
     end
     closestEntity = best
+end
+
+local function lookAtBall(ball, hrp)
+    if not CFG.AutoAim or not ball or not hrp then return end
+    pcall(function()
+        local ballPos = ball.Position
+        local playerPos = hrp.Position
+        local targetPos = Vector3.new(ballPos.X, playerPos.Y, ballPos.Z)
+        hrp.CFrame = CFrame.lookAt(playerPos, targetPos)
+    end)
 end
 
 -- ─────────────────────────────────────────────────────────
@@ -580,7 +601,6 @@ local function clickGuiBlockButton()
                     local name = btn.Name:lower()
                     if name:find("block") or name:find("parry") then
                         pcall(function()
-                            -- Fire all click handlers on GUI Button
                             if getconnections then
                                 for _, conn in ipairs(getconnections(btn.MouseButton1Click)) do conn:Fire() end
                                 for _, conn in ipairs(getconnections(btn.MouseButton1Down)) do conn:Fire() end
@@ -604,13 +624,29 @@ local function fireParry(isSpam)
     SES.parry_fired += 1
     if not isSpam then saveStats() end
 
-    -- Execution Method 1: Fire captured remote event
+    -- Auto Aim look-at execution
+    local ball = getBall()
+    local char = LP.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if ball and hrp then
+        lookAtBall(ball, hrp)
+    end
+
+    -- Execution Method 1: Fire captured remote event/function
     if ParryRemote then
         local ok = pcall(function()
-            if ParryArgs and #ParryArgs > 0 then
-                ParryRemote:FireServer(unpack(ParryArgs))
-            else
-                ParryRemote:FireServer()
+            if ParryRemote:IsA("RemoteEvent") then
+                if ParryArgs and #ParryArgs > 0 then
+                    ParryRemote:FireServer(unpack(ParryArgs))
+                else
+                    ParryRemote:FireServer()
+                end
+            elseif ParryRemote:IsA("RemoteFunction") then
+                if ParryArgs and #ParryArgs > 0 then
+                    ParryRemote:InvokeServer(unpack(ParryArgs))
+                else
+                    ParryRemote:InvokeServer()
+                end
             end
         end)
         if ok then return end
@@ -633,13 +669,11 @@ local function fireParry(isSpam)
     -- Execution Method 3: Simulate F keyboard key and Left Mouse click concurrently
     pcall(function()
         local vim = game:GetService("VirtualInputManager")
-        -- Trigger Press
         vim:SendKeyEvent(true, Enum.KeyCode.F, false, game)
         vim:SendMouseButtonEvent(Camera.ViewportSize.X/2, Camera.ViewportSize.Y/2, 0, true, game, 1)
         
         task.wait(0.01)
         
-        -- Trigger Release
         vim:SendKeyEvent(false, Enum.KeyCode.F, false, game)
         vim:SendMouseButtonEvent(Camera.ViewportSize.X/2, Camera.ViewportSize.Y/2, 0, false, game, 1)
     end)
@@ -648,12 +682,27 @@ end
 -- ─────────────────────────────────────────────────────────
 --  ROBUST TARGET CHECKER
 -- ─────────────────────────────────────────────────────────
+local function getBallTarget(ball)
+    local targetAttr = ball:GetAttribute("target") or ball:GetAttribute("Target") or ball:GetAttribute("TargetPlayer")
+    if targetAttr then return targetAttr end
+    
+    local targetVal = ball:FindFirstChild("target") or ball:FindFirstChild("Target") or ball:FindFirstChild("TargetPlayer") or ball:FindFirstChild("targetPlayer")
+    if targetVal and (targetVal:IsA("ValueBase") or targetVal:IsA("ObjectValue")) then
+        return targetVal.Value
+    end
+    return nil
+end
+
 local function checkIsTargeted(ball)
-    local ballTarget = ball:GetAttribute("target") or ball:GetAttribute("Target") or ball:GetAttribute("TargetPlayer")
+    local ballTarget = getBallTarget(ball)
     if not ballTarget then return false end
     
-    if typeof(ballTarget) == "Instance" and ballTarget:IsA("Player") then
-        return ballTarget == LP
+    if typeof(ballTarget) == "Instance" then
+        if ballTarget:IsA("Player") then
+            return ballTarget == LP
+        elseif ballTarget:IsA("PlayerGui") or ballTarget:IsA("Character") then
+            return ballTarget.Parent == LP or ballTarget == LP.Character
+        end
     elseif typeof(ballTarget) == "string" then
         return ballTarget == LP.Name or ballTarget == tostring(LP)
     elseif typeof(ballTarget) == "number" then
@@ -674,9 +723,13 @@ local function trackDeathSlash()
             local ball = getBall()
             if not ball then return end
             
-            -- Detect if deceased player was targeted
-            local targetName = ball:GetAttribute("target") or ball:GetAttribute("Target")
+            local targetName = getBallTarget(ball)
+            local targetMatch = false
             if targetName == char.Name or (typeof(targetName) == "Instance" and targetName.Name == char.Name) then
+                targetMatch = true
+            end
+            
+            if targetMatch then
                 local bv = getBallVelocity(ball)
                 local speed = bv.Magnitude
                 if speed >= 200 then
@@ -777,7 +830,6 @@ local function applyNoLag(on)
         pcall(function()
             settings().Rendering.QualityLevel = Enum.QualityLevel.Level01
         end)
-        -- Chunked disabling of visual clutter (no lag spikes)
         task.spawn(function()
             local count = 0
             for _, obj in ipairs(workspace:GetDescendants()) do
@@ -810,7 +862,7 @@ local function buildGUI()
     local sg = Instance.new("ScreenGui")
     sg.Name = "BB_Pro8"; sg.ResetOnSpawn=false
     sg.ZIndexBehavior=Enum.ZIndexBehavior.Sibling
-    sg.IgnoreGuiInset=true; sg.Parent=LP.PlayerGui
+    sg.IgnoreGuiInset=true; sg.Parent=LP.Parent.Players.LocalPlayer.PlayerGui
 
     local function corner(p,r) local c=Instance.new("UICorner"); c.CornerRadius=UDim.new(0,r or 10); c.Parent=p end
     local function lbl(par,props)
@@ -842,7 +894,7 @@ local function buildGUI()
         Text="⚔  BLADE BALL  PRO",TextColor3=Color3.fromRGB(160,65,255),
         Font=Enum.Font.GothamBold,TextSize=18,TextXAlignment=Enum.TextXAlignment.Left})
     lbl(main,{Size=UDim2.new(1,-12,0,14),Position=UDim2.new(0,14,0,36),
-        Text="v8.6  •  Ultimate Masterpiece",
+        Text="v8.7  •  Ultimate Masterpiece",
         TextColor3=Color3.fromRGB(65,45,110),Font=Enum.Font.Gotham,TextSize=11,
         TextXAlignment=Enum.TextXAlignment.Left})
     div(main, 54)
@@ -931,24 +983,26 @@ local function buildGUI()
     sec("COMBAT", 60)
     toggle("Auto Parry",  76,  "AutoParry", nil)
     toggle("Auto Spam",   116, "AutoSpam",  nil)
-    slider("Parry Accuracy", 156, "ParryAccuracy", 1, 100, nil)
+    toggle("Auto Aim",    156, "AutoAim",   nil)
+    slider("Parry Accuracy", 196, "ParryAccuracy", 1, 100, nil)
 
     -- DETECTION
-    div(main, 206, Color3.fromRGB(40,10,80))
-    sec("ABILITY DETECTION", 212)
-    toggle("Singularity Detection", 228, "SingularityDetect", nil)
-    toggle("Infinity Detection",    268, "InfinityDetect",    nil)
-    toggle("Time Hole Detection",   308, "TimeHoleDetect",    nil)
-    toggle("Anti-Phantom",          348, "AntiPhantom",       nil)
-    toggle("Anti-Tornado",          388, "TornadoDetect",     nil)
-    toggle("Auto Pre-Click",        428, "AutoPreClick",      nil)
+    div(main, 246, Color3.fromRGB(40,10,80))
+    sec("ABILITY DETECTION", 252)
+    toggle("Singularity Detection", 268, "SingularityDetect", nil)
+    toggle("Infinity Detection",    308, "InfinityDetect",    nil)
+    toggle("Time Hole Detection",   348, "TimeHoleDetect",    nil)
+    toggle("Anti-Phantom",          388, "AntiPhantom",       nil)
+    toggle("Anti-Tornado",          428, "TornadoDetect",     nil)
+    toggle("Auto Pre-Click",        468, "AutoPreClick",      nil)
 
     -- VISUAL
-    div(main, 470, Color3.fromRGB(40,10,80))
-    sec("VISUAL & MISC", 476)
-    toggle("Visualizer",   492, "Visualizer",  function(on) if not on then hideVis() end end)
-    toggle("No Lag",       532, "NoLag",        function(on) applyNoLag(on) end)
-    toggle("High Ping Comp",572,"HighPingCompensation",nil)
+    div(main, 510, Color3.fromRGB(40,10,80))
+    sec("VISUAL & MISC", 516)
+    toggle("Visualizer",   532, "Visualizer",  function(on) if not on then hideVis() end end)
+    toggle("No Lag",       572, "NoLag",        function(on) applyNoLag(on) end)
+    toggle("High Ping Comp",612,"HighPingCompensation",nil)
+    toggle("Show HUD",     652, "ShowHUD",      function(on) hud.Visible = on end)
 
     -- Status strip
     local stBG=Instance.new("Frame",sg)
@@ -994,10 +1048,8 @@ local function buildGUI()
         RichText = true
     })
 
-    toggle("Show HUD", 614, "ShowHUD", function(on) hud.Visible = on end)
-
-    div(main, 658, Color3.fromRGB(40,10,80))
-    lbl(main,{Size=UDim2.new(1,-20,0,12),Position=UDim2.new(0,10,0,660),
+    div(main, 694, Color3.fromRGB(40,10,80))
+    lbl(main,{Size=UDim2.new(1,-20,0,12),Position=UDim2.new(0,10,0,700),
         Text="[E] Spam  [Insert] GUI  [Tab] Stats",
         TextColor3=Color3.fromRGB(70,48,120),Font=Enum.Font.Gotham,TextSize=10})
 
@@ -1133,9 +1185,17 @@ RunService.PreSimulation:Connect(function()
     -- Robust Targeted Check
     local isTargeted = checkIsTargeted(ball)
 
-    -- Dot + curved detection
+    -- Direction check: do not parry if ball is moving away from us
     local dir = hrp.Position - ball.Position
     local dot = dir.Magnitude > 0 and dir.Unit:Dot(bv.Unit) or 0
+    
+    -- Absolute filter: if ball is moving away or perpendicular, do not proceed
+    if dot <= 0.02 then 
+        hideVis()
+        return 
+    end
+
+    -- Update histories since ball is coming towards us
     updateDotHistory(ball, dot)
     local curved, avgAngle = isCurved(ball, bv)
 
@@ -1150,7 +1210,7 @@ RunService.PreSimulation:Connect(function()
 
     -- HUD
     if HUDFrame and HUDFrame.Visible then
-        local targetName = ball:GetAttribute("target") or ball:GetAttribute("Target") or "Yok"
+        local targetName = getBallTarget(ball) or "Yok"
         if typeof(targetName) == "Instance" then targetName = targetName.Name end
         
         local targetColor = isTargeted and "rgb(255,55,55)" or "rgb(255,255,255)"
@@ -1197,22 +1257,23 @@ RunService.PreSimulation:Connect(function()
     local shouldParry = false
     local dist = (hrp.Position - ball.Position).Magnitude
     
+    -- Dynamic TTA target calculation
+    local pingSec = rawPing / 1000
+    local baseDelay = 0.035
+    local targetTTA = (pingSec * 1.05) + (baseDelay * getSDMult())
+    
+    if CFG.HighPingCompensation and rawPing > CFG.HighPingThreshold then
+        targetTTA = targetTTA * 1.2
+    end
+    
+    -- Curve TTA calibration
+    if curved then
+        local reduction = math.clamp(avgAngle / 20, 0.1, 0.35)
+        targetTTA = targetTTA * (1 - reduction)
+    end
+    
     if isTargeted then
         -- 1. TTA-based trigger (Ultimate precision)
-        local pingSec = rawPing / 1000
-        local baseDelay = 0.035
-        local targetTTA = (pingSec * 1.05) + (baseDelay * getSDMult())
-        
-        if CFG.HighPingCompensation and rawPing > CFG.HighPingThreshold then
-            targetTTA = targetTTA * 1.2
-        end
-        
-        -- Curve TTA calibration
-        if curved then
-            local reduction = math.clamp(avgAngle / 20, 0.1, 0.35)
-            targetTTA = targetTTA * (1 - reduction)
-        end
-        
         if tta ~= math.huge and tta <= targetTTA then
             shouldParry = true
         end
@@ -1222,10 +1283,14 @@ RunService.PreSimulation:Connect(function()
             shouldParry = true
         end
     else
-        -- free ball proximity check
-        local ballTarget = ball:GetAttribute("target") or ball:GetAttribute("Target")
-        if not ballTarget and dist <= range * 0.75 and dot > 0.4 then
-            shouldParry = true
+        -- Fallback: If ball is heading straight towards us (dot > 0.65) and is very close, parry anyway
+        -- This secures the player if target detection is delayed, missing, or obfuscated
+        if dot > 0.65 then
+            if tta ~= math.huge and tta <= targetTTA * 0.9 then
+                shouldParry = true
+            elseif dist <= range * 0.85 then
+                shouldParry = true
+            end
         end
     end
 
@@ -1314,7 +1379,7 @@ end)
 
 -- ─────────────────────────────────────────────────────────
 print("╔══════════════════════════════════════════════════╗")
-print("║   Blade Ball PRO v8.6 Masterpiece yüklendi!       ║")
-print("║   Triple-Redundancy & Robust Homing TTA aktif     ║")
+print("║   Blade Ball PRO v8.7 Masterpiece yüklendi!       ║")
+print("║   AutoAim & Target/Velocity Fallbacks aktif       ║")
 print("║   [Tab] Stats  [E] Spam  [Insert] GUI             ║")
 print("╚══════════════════════════════════════════════════╝")
