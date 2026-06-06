@@ -1,12 +1,13 @@
 --[[
     ╔══════════════════════════════════════════════════════════════╗
-    ║       BLADE BALL — ULTIMATE PRO SCRIPT v8.5                  ║
+    ║       BLADE BALL — ULTIMATE PRO SCRIPT v8.6                  ║
     ║                                                              ║
     ║   Features:                                                  ║
     ║   • Parry Remote: dual hookmetamethod & hookfunction         ║
     ║   • Dynamic Remote Interceptor (Input Correlation)           ║
+    ║   • Triple-Redundant Parry (Remote + GUI Click + VIM)        ║
     ║   • Wall Bounce Raycast Prediction (Masterpiece)             ║
-    ║   • Curved Ball Tracking (Angular Velocity & Dot Hist)       ║
+    ║   • Curved Ball Tracking (Homing TTA Fallback)               ║
     ║   • Singularity Cape / Infinity / Time Hole Detection        ║
     ║   • Phantom Detection                                        ║
     ║   • Statistics Panel (speed, accuracy, streak, persistent)   ║
@@ -91,7 +92,6 @@ end
 --  STATE
 -- ─────────────────────────────────────────────────────────
 local state = {
-    Parried      = false,
     ParryTime    = 0,
     Parries      = 0,
     IsPhantom    = false,
@@ -342,7 +342,7 @@ task.spawn(function()
 end)
 
 -- ─────────────────────────────────────────────────────────
---  BALL FINDER
+--  BALL FINDER & VELOCITY
 -- ─────────────────────────────────────────────────────────
 local function getBall()
     if BallsFolder then
@@ -409,13 +409,15 @@ local function predictBounce(ball, hrp, bv)
 end
 
 -- ─────────────────────────────────────────────────────────
---  ACCURATE TIME-TO-ARRIVE (TTA) SOLVER
+--  ACCURATE TIME-TO-ARRIVE (TTA) SOLVER (WITH CURVE FALLBACK)
 -- ─────────────────────────────────────────────────────────
 local function getAbsoluteTTA(ball, hrp, bv)
     local bp = ball.Position
     local pp = hrp.Position
     local speed = bv.Magnitude
     if speed < 0.5 then return math.huge end
+    
+    local dist = (pp - bp).Magnitude
     
     -- Check for wall bounce first
     local hitPos, reflectedVel, bounced = predictBounce(ball, hrp, bv)
@@ -424,25 +426,17 @@ local function getAbsoluteTTA(ball, hrp, bv)
         local distFromWall = (pp - hitPos).Magnitude
         
         -- total time = path distance / speed
-        local tta = (distToWall + distFromWall) / speed
-        
-        -- Verify that the reflected velocity actually heads towards the player
-        local dirToPlayer = (pp - hitPos).Unit
-        local dot = reflectedVel.Unit:Dot(dirToPlayer)
-        if dot < 0.15 then
-            return math.huge -- reflected ball misses the player
-        end
-        return tta
-    else
-        -- Standard straight-line quadratic solver
-        local rel = bp - pp
-        local a = bv:Dot(bv)
-        local b = 2 * rel:Dot(bv)
-        local c = rel:Dot(rel)
-        
-        local dc = b*b - 4*a*c
-        if dc < 0 then return math.huge end
-        
+        return (distToWall + distFromWall) / speed
+    end
+    
+    -- Standard straight-line quadratic solver
+    local rel = bp - pp
+    local a = bv:Dot(bv)
+    local b = 2 * rel:Dot(bv)
+    local c = rel:Dot(rel)
+    
+    local dc = b*b - 4*a*c
+    if dc >= 0 then
         local sq = math.sqrt(dc)
         local t1 = (-b - sq) / (2 * a)
         local t2 = (-b + sq) / (2 * a)
@@ -450,8 +444,17 @@ local function getAbsoluteTTA(ball, hrp, bv)
         local t = math.huge
         if t1 >= 0 then t = t1 end
         if t2 >= 0 and t2 < t then t = t2 end
-        return t
+        if t ~= math.huge then return t end
     end
+    
+    -- Fallback for curved/homing balls (direct projection)
+    local dirToPlayer = (pp - bp).Unit
+    local dotVal = bv.Unit:Dot(dirToPlayer)
+    if dotVal > 0.1 then
+        return dist / speed
+    end
+    
+    return math.huge
 end
 
 -- ─────────────────────────────────────────────────────────
@@ -562,9 +565,36 @@ local function checkAbilities(char)
 end
 
 -- ─────────────────────────────────────────────────────────
---  FIRE PARRY
+--  TRIPLE-REDUNDANT PARRY FIRE
 -- ─────────────────────────────────────────────────────────
 local lastFireTime = 0
+
+local function clickGuiBlockButton()
+    local playerGui = LP:FindFirstChild("PlayerGui")
+    if not playerGui then return false end
+    
+    for _, gui in ipairs(playerGui:GetChildren()) do
+        if gui:IsA("ScreenGui") and gui.Enabled then
+            for _, btn in ipairs(gui:GetDescendants()) do
+                if btn:IsA("GuiButton") and btn.Visible and btn.AbsoluteSize.X > 0 then
+                    local name = btn.Name:lower()
+                    if name:find("block") or name:find("parry") then
+                        pcall(function()
+                            -- Fire all click handlers on GUI Button
+                            if getconnections then
+                                for _, conn in ipairs(getconnections(btn.MouseButton1Click)) do conn:Fire() end
+                                for _, conn in ipairs(getconnections(btn.MouseButton1Down)) do conn:Fire() end
+                                for _, conn in ipairs(getconnections(btn.Activated)) do conn:Fire() end
+                            end
+                        end)
+                        return true
+                    end
+                end
+            end
+        end
+    end
+    return false
+end
 
 local function fireParry(isSpam)
     local now = tick()
@@ -574,7 +604,7 @@ local function fireParry(isSpam)
     SES.parry_fired += 1
     if not isSpam then saveStats() end
 
-    -- Method 1: Use captured remote (with fallback signatures)
+    -- Execution Method 1: Fire captured remote event
     if ParryRemote then
         local ok = pcall(function()
             if ParryArgs and #ParryArgs > 0 then
@@ -595,24 +625,41 @@ local function fireParry(isSpam)
             end
             ParryRemote:FireServer(0.5, tp, {})
         end)
-        return
     end
 
-    -- Method 2: Simulate keyboard F input (universal support)
-    pcall(function()
-        local vim = game:GetService("VirtualInputManager")
-        vim:SendKeyEvent(true, Enum.KeyCode.F, false, game)
-        task.wait(0.01)
-        vim:SendKeyEvent(false, Enum.KeyCode.F, false, game)
-    end)
+    -- Execution Method 2: Click on screen Gui Button
+    task.spawn(clickGuiBlockButton)
 
-    -- Method 3: Mouse click fallback
+    -- Execution Method 3: Simulate F keyboard key and Left Mouse click concurrently
     pcall(function()
         local vim = game:GetService("VirtualInputManager")
+        -- Trigger Press
+        vim:SendKeyEvent(true, Enum.KeyCode.F, false, game)
         vim:SendMouseButtonEvent(Camera.ViewportSize.X/2, Camera.ViewportSize.Y/2, 0, true, game, 1)
+        
         task.wait(0.01)
+        
+        -- Trigger Release
+        vim:SendKeyEvent(false, Enum.KeyCode.F, false, game)
         vim:SendMouseButtonEvent(Camera.ViewportSize.X/2, Camera.ViewportSize.Y/2, 0, false, game, 1)
     end)
+end
+
+-- ─────────────────────────────────────────────────────────
+--  ROBUST TARGET CHECKER
+-- ─────────────────────────────────────────────────────────
+local function checkIsTargeted(ball)
+    local ballTarget = ball:GetAttribute("target") or ball:GetAttribute("Target") or ball:GetAttribute("TargetPlayer")
+    if not ballTarget then return false end
+    
+    if typeof(ballTarget) == "Instance" and ballTarget:IsA("Player") then
+        return ballTarget == LP
+    elseif typeof(ballTarget) == "string" then
+        return ballTarget == LP.Name or ballTarget == tostring(LP)
+    elseif typeof(ballTarget) == "number" then
+        return ballTarget == LP.UserId
+    end
+    return false
 end
 
 -- ─────────────────────────────────────────────────────────
@@ -626,19 +673,21 @@ local function trackDeathSlash()
             if not CFG.AutoPreClick then return end
             local ball = getBall()
             if not ball then return end
-            local target = ball:GetAttribute("target")
-            if target == char.Name then
+            
+            -- Detect if deceased player was targeted
+            local targetName = ball:GetAttribute("target") or ball:GetAttribute("Target")
+            if targetName == char.Name or (typeof(targetName) == "Instance" and targetName.Name == char.Name) then
                 local bv = getBallVelocity(ball)
                 local speed = bv.Magnitude
                 if speed >= 200 then
                     local delay = math.random(120, 150) / 1000
                     task.delay(delay, function()
                         local currentBall = getBall()
-                        if currentBall == ball and ball:GetAttribute("target") == tostring(LP) and not state.Parried then
+                        local isTargeted = checkIsTargeted(ball)
+                        local elapsedSinceLastParry = tick() - state.ParryTime
+                        if currentBall == ball and isTargeted and elapsedSinceLastParry >= 0.08 then
                             fireParry(false)
-                            state.Parried = true
                             state.ParryTime = tick()
-                            task.delay(0.5, function() state.Parried = false end)
                         end
                     end)
                 end
@@ -793,7 +842,7 @@ local function buildGUI()
         Text="⚔  BLADE BALL  PRO",TextColor3=Color3.fromRGB(160,65,255),
         Font=Enum.Font.GothamBold,TextSize=18,TextXAlignment=Enum.TextXAlignment.Left})
     lbl(main,{Size=UDim2.new(1,-12,0,14),Position=UDim2.new(0,14,0,36),
-        Text="v8.5  •  Ultimate Masterpiece",
+        Text="v8.6  •  Ultimate Masterpiece",
         TextColor3=Color3.fromRGB(65,45,110),Font=Enum.Font.Gotham,TextSize=11,
         TextXAlignment=Enum.TextXAlignment.Left})
     div(main, 54)
@@ -1081,9 +1130,8 @@ RunService.PreSimulation:Connect(function()
 
     recordSpeed(speed)
 
-    -- Targeted?
-    local ballTarget = ball:GetAttribute("target")
-    local isTargeted = ballTarget == tostring(LP)
+    -- Robust Targeted Check
+    local isTargeted = checkIsTargeted(ball)
 
     -- Dot + curved detection
     local dir = hrp.Position - ball.Position
@@ -1102,7 +1150,9 @@ RunService.PreSimulation:Connect(function()
 
     -- HUD
     if HUDFrame and HUDFrame.Visible then
-        local targetName = ballTarget or "Yok"
+        local targetName = ball:GetAttribute("target") or ball:GetAttribute("Target") or "Yok"
+        if typeof(targetName) == "Instance" then targetName = targetName.Name end
+        
         local targetColor = isTargeted and "rgb(255,55,55)" or "rgb(255,255,255)"
         local ttaDisplay = tta == math.huge and "—" or string.format("%.3fs", tta)
         local velStr = string.format("X:%.1f Y:%.1f Z:%.1f", bv.X, bv.Y, bv.Z)
@@ -1120,7 +1170,11 @@ RunService.PreSimulation:Connect(function()
 
     if not CFG.AutoParry then return end
     if speed < 0.5 then return end
-    if state.Parried then return end
+
+    -- Debounce parry to avoid double firing on the same frame
+    local elapsedSinceLastParry = tick() - state.ParryTime
+    local minDebounce = 0.08 -- 80ms safe rally debounce
+    if elapsedSinceLastParry < minDebounce then return end
 
     -- Ability checks
     if checkAbilities(char) then return end
@@ -1153,6 +1207,12 @@ RunService.PreSimulation:Connect(function()
             targetTTA = targetTTA * 1.2
         end
         
+        -- Curve TTA calibration
+        if curved then
+            local reduction = math.clamp(avgAngle / 20, 0.1, 0.35)
+            targetTTA = targetTTA * (1 - reduction)
+        end
+        
         if tta ~= math.huge and tta <= targetTTA then
             shouldParry = true
         end
@@ -1161,32 +1221,29 @@ RunService.PreSimulation:Connect(function()
         if dist <= range then
             shouldParry = true
         end
-    elseif not ballTarget then
+    else
         -- free ball proximity check
-        if dist <= range * 0.75 and dot > 0.4 then
+        local ballTarget = ball:GetAttribute("target") or ball:GetAttribute("Target")
+        if not ballTarget and dist <= range * 0.75 and dot > 0.4 then
             shouldParry = true
         end
     end
 
     if shouldParry then
         fireParry(false)
-        state.Parried = true
         state.ParryTime = tick()
         state.Parries += 1
-        task.delay(0.5, function()
-            state.Parries = math.max(0, state.Parries - 1)
-        end)
-
+        
+        -- Reset streak if the parry wasn't successful (relying on client success listener)
         task.spawn(function()
-            repeat RunService.PreSimulation:Wait()
-            until (tick() - state.ParryTime) >= 1 or not state.Parried
-            state.Parried = false
-            if not SES.last_ok then SES.streak = 0 end
-            SES.last_ok = false
-        end)
-
-        ball:GetAttributeChangedSignal("target"):Once(function()
-            state.Parried = false
+            local currentParryTime = state.ParryTime
+            task.wait(0.8)
+            if state.ParryTime == currentParryTime then
+                if not SES.last_ok then 
+                    SES.streak = 0 
+                end
+                SES.last_ok = false
+            end
         end)
     end
 end)
@@ -1196,7 +1253,6 @@ task.spawn(function()
     local bf = workspace:WaitForChild("Balls", 60)
     if bf then
         bf.ChildRemoved:Connect(function(b)
-            state.Parried = false
             state.DotHistories[b] = nil
             state.VelHistories[b] = nil
             state.WasBackwards[b] = nil
@@ -1251,14 +1307,14 @@ end)
 --  CLEANUP
 -- ─────────────────────────────────────────────────────────
 LP.CharacterAdded:Connect(function()
-    state.Parried=false; state.Parries=0
+    state.Parries=0
     state.DotHistories={}; state.VelHistories={}; state.WasBackwards={}
     closestEntity=nil; SES.streak=0
 end)
 
 -- ─────────────────────────────────────────────────────────
 print("╔══════════════════════════════════════════════════╗")
-print("║   Blade Ball PRO v8.5 Masterpiece yüklendi!       ║")
-print("║   Dynamic Remote Interceptor & Bounce Solver aktif║")
+print("║   Blade Ball PRO v8.6 Masterpiece yüklendi!       ║")
+print("║   Triple-Redundancy & Robust Homing TTA aktif     ║")
 print("║   [Tab] Stats  [E] Spam  [Insert] GUI             ║")
 print("╚══════════════════════════════════════════════════╝")
